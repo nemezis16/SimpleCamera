@@ -17,6 +17,9 @@
 @property (weak, nonatomic) IBOutlet UIButton *stillButton;
 @property (weak, nonatomic) IBOutlet UIButton *cameraButton;
 
+@property (strong, nonatomic) UIColor *redColor;
+@property (strong, nonatomic) UIColor *defaultColor;
+
 @property (weak, nonatomic) IBOutlet ORPreviewView *capturePreviewView;
 
 @property (strong, nonatomic) ORCaptureProcessor *captureProcessor;
@@ -37,6 +40,9 @@
 {
     [super viewDidAppear:animated];
     
+    self.defaultColor = self.recordButton.backgroundColor;
+    self.redColor = [UIColor redColor];
+    
     [self.captureProcessor startRunning];
 }
 
@@ -52,6 +58,7 @@
 - (IBAction)handleRecordButtonTapped:(id)sender
 {
     [self.captureProcessor recordMovieToFile:nil];
+    self.recordButton.backgroundColor = self.redColor;
 }
 
 - (IBAction)handleStillButtonTapped:(id)sender
@@ -66,7 +73,7 @@
 
 - (IBAction)handleCameraButtonTapped:(id)sender
 {
-    
+    [self.captureProcessor changeCamera];
 }
 
 #pragma mark - ORCaptureProcessorDelegate
@@ -93,7 +100,7 @@
 
 - (void)captureProcessor:(ORCaptureProcessor *)captureProcessor finishedRecordingToFile:(NSURL *)fileURL
 {
-    
+    self.recordButton.backgroundColor = self.defaultColor;
 }
 
 #pragma mark - Orientation

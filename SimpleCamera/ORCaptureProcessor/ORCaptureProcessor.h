@@ -57,5 +57,6 @@ typedef NS_ENUM(NSInteger, ORCaptureSetupResult) {
 //if fileURL == nil then record directly to gallery
 - (void)recordMovieToFile:(NSURL *)fileURL;
 - (void)snapStillImage;
+- (void)changeCamera;
 
 @end

@@ -16,7 +16,9 @@ static void * CapturingStillImageContext = &CapturingStillImageContext;
 static NSString *const SessionRunningKeyPath = @"running";
 static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
 
-@interface ORCaptureProcessor () <AVCaptureFileOutputRecordingDelegate>
+static CGFloat const BitrateReductionFactor = 1.f;
+
+@interface ORCaptureProcessor () <AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
 
 @property (strong, nonatomic) dispatch_queue_t sessionQueue;
 
@@ -26,12 +28,19 @@ static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
 @property (assign, nonatomic) ORCaptureSetupResult audioSetupResult;
 
 @property (strong, nonatomic) AVCaptureDeviceInput *videoDeviceInput;
-@property (strong, nonatomic) AVCaptureMovieFileOutput *movieFileOutput;
+
+@property (strong, nonatomic) AVCaptureVideoDataOutput *videoDataOutput;
+@property (strong, nonatomic) AVCaptureAudioDataOutput *audioDataOutput;
+
+@property (strong, nonatomic) AVAssetWriter *assetWriter;
+@property (strong, nonatomic) AVAssetWriterInput *assetWriterVideoInput;
+@property (strong, nonatomic) AVAssetWriterInput *assetWriterAudioInput;
+
 @property (strong, nonatomic) AVCaptureStillImageOutput *stillImageOutput;
-
-@property (strong, nonatomic) NSDate *startCapturingDate;
-
+@property (assign, nonatomic) CMTime currentTimeStamp;
 @property (assign, nonatomic, getter = isSessionRunning) BOOL sessionRunning;
+
+@property (strong, nonatomic) NSURL *videoOutputFileURL;
 
 @end
 
@@ -63,7 +72,7 @@ static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
 
 - (BOOL)isRecording
 {
-    return self.movieFileOutput.isRecording;
+    return self.assetWriter.status == AVAssetWriterStatusWriting;
 }
 
 #pragma mark - Public
@@ -135,27 +144,87 @@ static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
     });
 }
 
+#warning remove white frame
 - (void)recordMovieToFile:(NSURL *)fileURL
 {
+    [ORCaptureProcessor setFlashMode:AVCaptureFlashModeOff forDevice:self.videoDeviceInput.device];
+    
     dispatch_async(self.sessionQueue, ^{
-        if (!self.movieFileOutput.isRecording) {
+        if (!self.isRecording) {
             if ([UIDevice currentDevice].isMultitaskingSupported) {
                 self.backgroundRecordingID = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:nil];
             }
-            self.startCapturingDate = [NSDate date];
             
-            AVCaptureVideoPreviewLayer *previewLayer = (AVCaptureVideoPreviewLayer *)self.previewView.layer;
-            AVCaptureConnection *connection = [self.movieFileOutput connectionWithMediaType:AVMediaTypeVideo];
-            connection.videoOrientation = previewLayer.connection.videoOrientation;
-            [ORCaptureProcessor setFlashMode:AVCaptureFlashModeOff forDevice:self.videoDeviceInput.device];
-            
-            NSURL *outputFileURL = fileURL ?: [self defaultFileURL];
+            self.videoOutputFileURL = fileURL ?: [self defaultFileURL];
 
-            [self.movieFileOutput startRecordingToOutputFileURL:outputFileURL recordingDelegate:self];
+            [self setupAssetWriterInputs];
+            [self setupAssetWriterWithOutputFileURL:self.videoOutputFileURL];
+            
+            self.assetWriterVideoInput.transform = [self videoTransformFromVideoOrientation];
+            [self.assetWriter startWriting];
+            [self.assetWriter startSessionAtSourceTime:self.currentTimeStamp];
         } else {
-            [self.movieFileOutput stopRecording];
+            [self.assetWriterVideoInput markAsFinished];
+            [self.assetWriterAudioInput markAsFinished];
+            [self.assetWriter finishWritingWithCompletionHandler:^{
+                [self saveVideoOutputToGalleryFromFile:self.videoOutputFileURL];
+                [self performFinishingRecordingToFileMethodDelegateWithURL:self.videoOutputFileURL];
+            }];
         }
     });
+}
+
+- (void)changeCamera
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AVCaptureSession *session = self.previewView.session;
+        AVCaptureDevice *currentVideoDevice = self.videoDeviceInput.device;
+        
+        AVCaptureDevicePosition preferredPosition = AVCaptureDevicePositionUnspecified;
+        AVCaptureDevicePosition currentPosition = currentVideoDevice.position;
+        
+        switch (currentPosition) {
+            case AVCaptureDevicePositionUnspecified:
+            case AVCaptureDevicePositionFront: {
+                preferredPosition = AVCaptureDevicePositionBack;
+                break;
+            }
+            case AVCaptureDevicePositionBack: {
+                preferredPosition = AVCaptureDevicePositionFront;
+                break;
+            }
+        }
+        
+        AVCaptureDevice *videoDevice = [ORCaptureProcessor deviceWithMediaType:AVMediaTypeVideo preferringPosition:preferredPosition];
+        AVCaptureDeviceInput *videoDeviceInput = [AVCaptureDeviceInput deviceInputWithDevice:videoDevice error:nil];
+        
+        [session beginConfiguration];
+        [session removeInput:self.videoDeviceInput];
+        if ([session canAddInput:videoDeviceInput]) {
+            [[NSNotificationCenter defaultCenter]removeObserver:self name:AVCaptureDeviceSubjectAreaDidChangeNotification object:currentVideoDevice];
+            
+            [ORCaptureProcessor setFlashMode:AVCaptureFlashModeAuto forDevice:videoDevice];
+            
+            [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(subjectAreaDidChange:) name:AVCaptureDeviceSubjectAreaDidChangeNotification object:self.videoDeviceInput.device];
+            
+            [session addInput:videoDeviceInput];
+            self.videoDeviceInput = videoDeviceInput;
+        } else {
+            [session addInput:self.videoDeviceInput];
+        }
+        
+        AVCaptureConnection *connection = [self.videoDataOutput connectionWithMediaType:AVMediaTypeVideo];
+        if (connection.isVideoStabilizationSupported) {
+            connection.preferredVideoStabilizationMode = AVCaptureVideoStabilizationModeAuto;
+        }
+        
+        [session commitConfiguration];
+    });
+}
+
+- (void)focusAndExpose
+{
+#warning todo
 }
 
 #pragma mark - AVCaptureFileOutputRecordingDelegate
@@ -211,8 +280,21 @@ static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
 
 - (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection
 {
-    CMTime currentTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-#warning todo
+     self.currentTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    
+    if ([captureOutput isEqual:self.videoDataOutput]) {
+        if ([self.assetWriterVideoInput isReadyForMoreMediaData]) {
+            if(![self.assetWriterVideoInput appendSampleBuffer:sampleBuffer]) {
+                NSLog(@"Unable to write to video writer input");
+            }
+        }
+    } else if ([captureOutput isEqual:self.audioDataOutput]) {
+        if ([self.assetWriterAudioInput isReadyForMoreMediaData]) {
+            if (![self.assetWriterAudioInput appendSampleBuffer:sampleBuffer]) {
+                NSLog(@"Unable to write to audio writer input");
+            }
+        }
+    }
 }
 
 #pragma mark - Private
@@ -311,6 +393,41 @@ static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
     }
 }
 
+- (void)setupAssetWriterInputs
+{
+    NSDictionary *videoSettings = [self outputVideoSettings];
+    NSDictionary *audioSettings = [self.audioDataOutput recommendedAudioSettingsForAssetWriterWithOutputFileType:AVFileTypeQuickTimeMovie];
+    
+    self.assetWriterVideoInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
+    self.assetWriterVideoInput.expectsMediaDataInRealTime = YES;
+    
+    self.assetWriterAudioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
+    self.assetWriterAudioInput.expectsMediaDataInRealTime = YES;
+}
+
+- (void)setupAssetWriterWithOutputFileURL:(NSURL *)fileURL
+{
+    NSError *error;
+    
+    self.assetWriter = [AVAssetWriter assetWriterWithURL:fileURL fileType:AVFileTypeQuickTimeMovie error:&error];
+    
+    if (error) {
+        NSLog(@"Failed to instantiate assets writer with error: %@", error);
+    }
+    
+    if ([self.assetWriter canAddInput:self.assetWriterVideoInput]) {
+        [self.assetWriter addInput:self.assetWriterVideoInput];
+    } else {
+        NSLog(@"Cannot add video input to writer");
+    }
+    
+    if ([self.assetWriter canAddInput:self.assetWriterAudioInput]) {
+        [self.assetWriter addInput:self.assetWriterAudioInput];
+    } else {
+        NSLog(@"Cannot add audio input to writer");
+    }
+}
+
 - (AVCaptureDeviceInput *)defaultVideoDeviceInput
 {
     NSError *error;
@@ -341,23 +458,32 @@ static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
 {
     AVCaptureSession *session = self.previewView.session;
     
-    AVCaptureMovieFileOutput *movieFileOutput = [[AVCaptureMovieFileOutput alloc] init];
+    self.videoDataOutput = [AVCaptureVideoDataOutput new];
+    [self.videoDataOutput setSampleBufferDelegate:self queue:self.sessionQueue];
     
-    if ([session canAddOutput:movieFileOutput]) {
-        [session addOutput:movieFileOutput];
-        AVCaptureConnection *connection = [movieFileOutput connectionWithMediaType:AVMediaTypeVideo];
-        if (connection.isVideoStabilizationSupported) {
+    self.audioDataOutput = [AVCaptureAudioDataOutput new];
+    [self.audioDataOutput setSampleBufferDelegate:self queue:self.sessionQueue];
+    
+    if ([session canAddOutput:self.videoDataOutput]) {
+        [session addOutput:self.videoDataOutput];
+        AVCaptureConnection *connection = [self.videoDataOutput connectionWithMediaType:AVMediaTypeVideo];
+        if ( connection.isVideoStabilizationSupported ) {
             connection.preferredVideoStabilizationMode = AVCaptureVideoStabilizationModeAuto;
         }
-        self.movieFileOutput = movieFileOutput;
     } else {
-        NSLog(@"Could not add movie file output to the session");
+        NSLog(@"Could not add video output to the session");
         self.cameraSetupResult = ORCaptureSetupResultSessionConfigurationFailed;
     }
     
+    if ([session canAddOutput:self.audioDataOutput]) {
+        [session addOutput:self.audioDataOutput];
+    } else {
+        NSLog(@"Could not add audio output to the session");
+    }
+    
     AVCaptureStillImageOutput *stillImageOutput = [[AVCaptureStillImageOutput alloc] init];
+    stillImageOutput.outputSettings = @{AVVideoCodecKey : AVVideoCodecJPEG};
     if ([session canAddOutput:stillImageOutput]) {
-        stillImageOutput.outputSettings = @{AVVideoCodecKey : AVVideoCodecJPEG};
         [session addOutput:stillImageOutput];
         self.stillImageOutput = stillImageOutput;
     } else {
@@ -404,6 +530,82 @@ static NSString *const CapturingStillImageKeyPath = @"capturingStillImage";
             NSLog( @"Could not lock device for configuration: %@", error );
         }
     }
+}
+
+- (NSDictionary *)outputVideoSettings
+{
+    NSMutableDictionary *outputSettings = [[self.videoDataOutput recommendedVideoSettingsForAssetWriterWithOutputFileType:AVFileTypeQuickTimeMovie] mutableCopy];
+    
+    NSMutableDictionary *compressionProperties = [outputSettings[AVVideoCompressionPropertiesKey] mutableCopy];
+    CGFloat bitrate = [compressionProperties[AVVideoAverageBitRateKey] doubleValue];
+    compressionProperties[AVVideoAverageBitRateKey] = @(bitrate * BitrateReductionFactor);
+    outputSettings[AVVideoCompressionPropertiesKey] = compressionProperties;
+    
+    return outputSettings;
+}
+
+- (void)saveVideoOutputToGalleryFromFile:(NSURL *)fileURL
+{
+    UIBackgroundTaskIdentifier currentBackgroundRecordingID = self.backgroundRecordingID;
+    self.backgroundRecordingID = UIBackgroundTaskInvalid;
+    
+    dispatch_block_t cleanup = ^{
+        [[NSFileManager defaultManager] removeItemAtURL:fileURL error:nil];
+        if ( currentBackgroundRecordingID != UIBackgroundTaskInvalid ) {
+            [[UIApplication sharedApplication] endBackgroundTask:currentBackgroundRecordingID];
+        }
+    };
+
+    [PHPhotoLibrary requestAuthorization:^( PHAuthorizationStatus status ) {
+        if ( status == PHAuthorizationStatusAuthorized ) {
+            [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+           
+                if ( [PHAssetResourceCreationOptions class] ) {
+                    PHAssetResourceCreationOptions *options = [[PHAssetResourceCreationOptions alloc] init];
+                    options.shouldMoveFile = YES;
+                    PHAssetCreationRequest *changeRequest = [PHAssetCreationRequest creationRequestForAsset];
+                    [changeRequest addResourceWithType:PHAssetResourceTypeVideo fileURL:fileURL options:options];
+                }
+                else {
+                    [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileURL];
+                }
+            } completionHandler:^( BOOL success, NSError *error ) {
+                if ( ! success ) {
+                    NSLog( @"Could not save movie to photo library: %@", error );
+                }
+                cleanup();
+            }];
+        } else {
+            cleanup();
+        }
+    }];
+}
+
+- (CGAffineTransform)videoTransformFromVideoOrientation
+{
+    CGFloat angle = 0.f;
+    
+    AVCaptureVideoPreviewLayer *previewLayer = (AVCaptureVideoPreviewLayer *)self.previewView.layer;
+    
+    switch (previewLayer.connection.videoOrientation) {
+        case AVCaptureVideoOrientationPortrait: {
+            angle = M_PI_2;
+            break;
+        }
+        case AVCaptureVideoOrientationLandscapeLeft: {
+            angle = -M_PI;
+            break;
+        }
+        case AVCaptureVideoOrientationPortraitUpsideDown: {
+            angle = M_PI_2;
+            break;
+        }
+        default: {
+            return CGAffineTransformIdentity;
+        }
+    }
+    
+    return CGAffineTransformMakeRotation(angle);
 }
 
 #pragma mark - VideoOrientation
